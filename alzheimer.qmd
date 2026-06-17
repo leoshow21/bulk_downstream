@@ -1,0 +1,555 @@
+---
+title: "RNAseq - Análise de Alzheimer (pseudo-Bulk)"
+subtitle: "Replicação de Srinivasan et al., 2020 (GSE125583)"
+format: html
+editor: visual
+---
+
+### 1.1 Library and set working directories
+
+```{r}
+#| message: false
+#| warning: false
+library(tidyverse)
+library(GEOquery)
+library(DESeq2)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(matrixStats)
+library(readxl)
+library(ggrepel)
+library(clusterProfiler) 
+library(org.Hs.eg.db)    
+library(patchwork)       
+library(STRINGdb)        
+library(igraph)          
+library(tidygraph)       
+library(ggraph)          
+library(WGCNA)           
+library(lionessR)        
+library(SummarizedExperiment)
+
+dir_data <- "C:/Users/leoga/Downloads/diego_disciplina/data/GSE125583_RAW"
+file_series <- "C:/Users/leoga/Downloads/diego_disciplina/data/GSE125583_series_matrix.txt.gz"
+file_annotation2 <- "C:/Users/leoga/Downloads/diego_disciplina/annotation2.xlsx"
+
+```
+
+### 1.2 Counts table and metadata
+
+```{r}
+#| message: false
+#| warning: false
+gse <- getGEO(filename = file_series)
+meta_geo <- pData(gse) %>%
+  transmute(
+    sample = geo_accession,
+    title = title,
+    source = source_name_ch1,
+    group_geo = sub(".*: ", "", characteristics_ch1.2),  
+    age = sub(".*: ", "", characteristics_ch1.3),   
+    braak = factor(sub(".*: ", "", `braak.score:ch1`), levels = c("I","II","III","IV","V","VI"), ordered = TRUE)
+  )
+
+ann2 <- read_excel(file_annotation2)
+colnames(ann2) <- tolower(colnames(ann2)) 
+
+ann2 <- ann2 %>% filter(!is.na(sample_id))
+
+meta <- meta_geo %>%
+  mutate(
+    sam_id_extracted = str_extract(title, "SAM\\d+"),
+    join_key = ifelse(is.na(sam_id_extracted), title, sam_id_extracted)
+  ) %>%
+  left_join(ann2, by = c("join_key" = "sample_id")) %>%
+  mutate(
+    cell_type_geo = case_when(
+      str_detect(tolower(coalesce(source, title)), "astrocyte") ~ "astrocyte",
+      str_detect(tolower(coalesce(source, title)), "endothelial") ~ "endothelial",
+      str_detect(tolower(coalesce(source, title)), "microglia") ~ "microglia",
+      str_detect(tolower(coalesce(source, title)), "neuron") ~ "neuron",
+      str_detect(tolower(coalesce(source, title)), "oligo") ~ "oligo",
+      TRUE ~ "Unknown"
+    ),
+    cell_type = coalesce(tolower(as.character(celltype)), cell_type_geo),
+    cell_type = factor(str_replace(cell_type, "oligodendrocyte", "oligo")),
+    
+    sex = factor(coalesce(as.character(sex), "Unknown")),
+    group = factor(coalesce(diagnosis, group_geo), levels = c("Control", "AD", "control", "Alzheimer's disease"))
+  ) %>%
+  mutate(
+    group = recode_factor(group, 
+                          "control" = "Control", 
+                          "Control" = "Control",
+                          "Alzheimer's disease" = "AD",
+                          "AD" = "AD")
+  )
+
+arquivos <- list.files(dir_data, pattern = "GSM.*\\.gz$", full.names = TRUE)
+
+ler_amostra <- function(caminho) {
+  id_gsm <- str_extract(basename(caminho), "GSM\\d+")
+  df <- read.table(gzfile(caminho), fill = TRUE, header = FALSE, col.names = paste0("V", 1:15), stringsAsFactors = FALSE)
+  df <- df[, 1:2]
+  colnames(df) <- c("gene_id", id_gsm)
+  return(df)
+}
+
+counts_matrix <- arquivos %>% 
+  map(ler_amostra) %>% 
+  purrr::reduce(full_join, by = "gene_id") %>%
+  filter(!is.na(gene_id), !gene_id %in% c("gene_id", "Gene", "ID")) %>% 
+  mutate(across(-gene_id, ~ as.numeric(.))) %>%            
+  mutate(across(-gene_id, ~ replace_na(., 0))) %>%         
+  column_to_rownames("gene_id")
+
+common_samples <- intersect(colnames(counts_matrix), meta$sample)
+counts_final <- as.matrix(counts_matrix[, common_samples])
+meta <- meta %>% filter(sample %in% common_samples) %>% arrange(match(sample, colnames(counts_final))) 
+stopifnot(all(meta$sample == colnames(counts_final)))
+```
+
+### 1.3 Quality Control (QC)
+
+```{r}
+#| warning: false
+#| fig-width: 12
+#| fig-height: 8
+qc_tbl_long <- meta %>%
+  mutate(
+    lib_size = colSums(counts_final),
+    genes_detected = colSums(counts_final > 0)
+  ) %>%
+  arrange(group, lib_size) %>%
+  mutate(sample = factor(sample, levels = unique(sample))) %>% 
+  pivot_longer(cols = c(lib_size, genes_detected), names_to = "Metrica", values_to = "Valor") %>%
+  mutate(Metrica = case_when(
+    Metrica == "lib_size" ~ "Tamanho da Biblioteca (Reads)",
+    Metrica == "genes_detected" ~ "Genes Detectados (>0 reads)"
+  ))
+
+linhas_corte <- qc_tbl_long %>% group_by(Metrica) %>% summarise(corte_medio = mean(Valor))
+
+ggplot(qc_tbl_long, aes(x = sample, y = Valor, fill = group)) +
+  geom_col(width = 1) + 
+  geom_hline(data = linhas_corte, aes(yintercept = corte_medio), color = "red", linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ Metrica, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = c("AD" = "#F8766D", "Control" = "#00BFC4")) +
+  theme_bw() +
+  labs(title = "QC: Desempenho por Amostra", x = "Amostras Individuais (n = 289)", y = "") +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold", size = 12),
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(), panel.grid.major.x = element_blank())
+
+
+```
+
+### 1.4 DE & PCA
+
+```{r}
+#| message: false
+#| warning: false
+design_vars <- c("sex", "cell_type", "group")
+vars_to_keep <- c()
+
+for (v in design_vars) {
+  if (length(unique(meta[[v]])) > 1) {
+    vars_to_keep <- c(vars_to_keep, v)
+  } else {
+    message(paste("Aviso: Variável", v, "é constante e será ignorada no design."))
+  }
+}
+
+formula_deseq <- as.formula(paste("~", paste(vars_to_keep, collapse = " + ")))
+
+dds <- DESeqDataSetFromMatrix(countData = round(counts_final), colData = meta, design = formula_deseq)
+
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+
+vsd <- vst(dds, blind = FALSE)
+
+pca_data <- plotPCA(vsd, intgroup = c("group", "cell_type"), ntop = 1000, returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = cell_type, shape = group)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  labs(title = "PCA Global",
+       x = paste0("PC1: ", percentVar[1], "% variance"), 
+       y = paste0("PC2: ", percentVar[2], "% variance"),
+       color = "Tipo Celular", shape = "Diagnóstico")
+```
+
+### 2.0 DE
+
+```{r}
+#| message: false
+#| warning: false
+#| message: false
+#| warning: false
+#| message: false
+#| warning: false
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("group", "AD", "Control"))
+res_df <- as.data.frame(res) %>% 
+  rownames_to_column("gene") %>%
+  filter(!is.na(padj)) %>%
+  mutate(status = case_when(
+    padj < 0.05 & log2FoldChange > 0.58 ~ "Up em AD",
+    padj < 0.05 & log2FoldChange < -0.58 ~ "Down em AD",
+    TRUE ~ "NS"
+  ))
+
+anotacao <- suppressWarnings(read_excel(file_annotation, sheet = "Human Genes", skip = 12)) %>%
+  dplyr::select(Gene_Symbol = 1, Gene_ID = 2) %>%
+  mutate(Gene_ID = as.character(Gene_ID))
+
+res_df_anotado <- res_df %>% 
+  left_join(anotacao, by = c("gene" = "Gene_ID")) %>%
+  mutate(Gene_Symbol = ifelse(is.na(Gene_Symbol), gene, Gene_Symbol))
+
+```
+
+### 2.1 Volcano plot with top 10 up and down
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+top_destaque <- bind_rows(
+  res_df_anotado %>% filter(status == "Up em AD") %>% arrange(padj) %>% head(10),
+  res_df_anotado %>% filter(status == "Down em AD") %>% arrange(padj) %>% head(10)
+)
+ggplot(res_df_anotado, aes(x = log2FoldChange, y = -log10(padj), color = status)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_text_repel(data = top_destaque, aes(label = Gene_Symbol), size = 3.5, color = "black", fontface = "bold", box.padding = 0.8, max.overlaps = Inf) +
+  scale_color_manual(values = c("Down em AD" = "royalblue", "NS" = "grey80", "Up em AD" = "firebrick")) +
+  geom_vline(xintercept = c(-0.58, 0.58), linetype = "dashed", alpha = 0.5) + geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+  theme_bw() + labs(title = "Volcano Plot: Expressão Diferencial", x = "Log2 FC", y = "-Log10(Padj)")
+
+```
+
+### 2.2 Heatmap with top 50 genes
+
+```{r}
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+top_50 <- res_df_anotado %>% arrange(padj) %>% head(50)
+mat_zscore <- t(scale(t(assay(vsd)[top_50$gene, ])))
+rownames(mat_zscore) <- make.unique(top_50$Gene_Symbol)
+
+df_anno_heatmap <- data.frame(
+  Grupo = meta$group,
+  Celular = meta$cell_type,
+  row.names = meta$sample
+)
+
+pheatmap(mat_zscore,
+         annotation_col = df_anno_heatmap,
+         annotation_colors = list(
+           Grupo = c("AD" = "#F8766D", "Control" = "#00BFC4"),
+           Celular = c("astrocyte" = "#e41a1c", "endothelial" = "#377eb8", "microglia" = "#4daf4a", "neuron" = "#984ea3", "oligo" = "#ff7f00")
+         ),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(100),
+         show_colnames = FALSE, cluster_cols = TRUE, fontsize_row = 7,
+         main = "Top 50 DEGs por tipo celular")
+```
+
+### 2.3 GO Functional Enrichment
+
+```{r}
+#| warning: false
+#| message: false
+genes_up <- res_df_anotado %>% filter(status == "Up em AD") %>% pull(gene) %>% na.omit()
+genes_down <- res_df_anotado %>% filter(status == "Down em AD") %>% pull(gene) %>% na.omit()
+
+ego_up <- enrichGO(gene = genes_up, OrgDb = org.Hs.eg.db, ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.05, readable = TRUE)
+ego_down <- enrichGO(gene = genes_down, OrgDb = org.Hs.eg.db, ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.05, readable = TRUE)
+
+p_up <- dotplot(ego_up, showCategory = 8, title = "Vias (Up em AD)") + theme(plot.title = element_text(size = 11, face = "bold"))
+p_down <- dotplot(ego_down, showCategory = 8, title = "Vias (Down em AD)") + theme(plot.title = element_text(size = 11, face = "bold"))
+
+p_up + p_down
+
+```
+
+```{r}
+#| warning: false
+#| message: false
+options(timeout = 600)
+string_db <- STRINGdb$new(version="12.0", species=9606, score_threshold=700, input_directory="")
+
+top_genes <- res_df_anotado %>% 
+  filter(status != "NS", !is.na(Gene_Symbol)) %>% 
+  arrange(padj) %>% head(400) %>% 
+  dplyr::select(Gene_Symbol, log2FoldChange) %>% distinct(Gene_Symbol, .keep_all = TRUE)
+
+mapped_genes <- string_db$map(top_genes, "Gene_Symbol", removeUnmappedRows = TRUE) %>% 
+  filter(!is.na(STRING_id)) %>% distinct(STRING_id, .keep_all = TRUE)
+
+hits <- mapped_genes$STRING_id
+interacoes <- string_db$get_interactions(hits)
+edges_limpas <- interacoes[, c("from", "to")] %>% filter(complete.cases(.))
+
+grafo_base <- igraph::graph_from_data_frame(edges_limpas, directed = FALSE)
+
+tidy_ppi <- as_tbl_graph(grafo_base) %>%
+  activate(nodes) %>%
+  mutate(STRING_id = name) %>%
+  left_join(mapped_genes, by = "STRING_id") %>%
+  mutate(degree = centrality_degree(), componente = group_components()) %>%   
+  filter(componente == 1)                         
+
+```
+
+### 2.4 PPI networks
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 10
+#| fig-height: 10
+set.seed(123)
+
+get_top_pathway_genes <- function(ego_obj, n=2) {
+  if(is.null(ego_obj) || !is(ego_obj, "enrichResult") || nrow(as.data.frame(ego_obj)) == 0) return(character(0))
+  ego_df <- as.data.frame(ego_obj)
+  n_actual <- min(n, nrow(ego_df))
+  gene_lists <- ego_df$geneID[1:n_actual]
+  all_genes_vector <- unique(unlist(strsplit(gene_lists, "/")))
+  return(all_genes_vector)
+}
+
+top_up <- get_top_pathway_genes(ego_up, n = 2)
+top_down <- get_top_pathway_genes(ego_down, n = 2)
+genes_condutores <- unique(c(top_up, top_down))
+
+tidy_ppi <- tidy_ppi %>%
+  activate(nodes) %>%
+  mutate(
+    is_hero = Gene_Symbol %in% genes_condutores,
+    node_alpha = ifelse(is_hero, 1, 0.2), 
+    hero_label = ifelse(is_hero, Gene_Symbol, "") 
+  )
+
+ggraph(tidy_ppi, layout = "fr") + 
+  geom_edge_link(alpha = 0.2, color = "grey50") +
+  geom_node_point(aes(size = degree, color = log2FoldChange, alpha = node_alpha)) +
+  geom_node_text(
+    aes(label = hero_label), 
+    repel = TRUE, size = 4.5, fontface = "bold", bg.color = "white",
+    max.overlaps = Inf 
+  ) +
+  scale_color_gradient2(low = "royalblue", mid = "white", high = "firebrick", midpoint = 0) +
+  scale_size_continuous(range = c(2, 12)) +
+  scale_alpha_identity() +
+  theme_void() + 
+  labs(title = "Rede PPI",
+       color = "Log2 Fold Change", size = "Conexões (Grau)") +
+  theme(legend.position = "bottom", plot.title = element_text(size = 16, face = "bold"))
+
+```
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 10
+#| fig-height: 10
+set.seed(123)
+
+get_top_pathway_genes <- function(ego_obj, n=2) {
+  if(is.null(ego_obj) || !is(ego_obj, "enrichResult") || nrow(as.data.frame(ego_obj)) == 0) return(character(0))
+  ego_df <- as.data.frame(ego_obj)
+  n_actual <- min(n, nrow(ego_df))
+  gene_lists <- ego_df$geneID[1:n_actual]
+  return(unique(unlist(strsplit(gene_lists, "/"))))
+}
+
+top_up <- get_top_pathway_genes(ego_up, n = 2)
+top_down <- get_top_pathway_genes(ego_down, n = 2)
+genes_condutores <- unique(c(top_up, top_down))
+
+tidy_ppi <- tidy_ppi %>%
+  activate(nodes) %>%
+  mutate(
+    is_hero = Gene_Symbol %in% genes_condutores,
+    node_alpha = ifelse(is_hero, 1, 0.2), 
+    hero_label = ifelse(is_hero, Gene_Symbol, "") 
+  )
+
+ggraph(tidy_ppi, layout = "fr") + 
+  geom_edge_link(alpha = 0.2, color = "grey50") +
+  geom_node_point(aes(size = degree, color = log2FoldChange, alpha = node_alpha)) +
+  geom_node_text(aes(label = hero_label), repel = TRUE, size = 4.5, fontface = "bold", bg.color = "white", max.overlaps = Inf) +
+  scale_color_gradient2(low = "royalblue", mid = "white", high = "firebrick", midpoint = 0) +
+  scale_size_continuous(range = c(2, 12)) +
+  scale_alpha_identity() +
+  theme_void() + labs(title = "Rede PPI: Fios Condutores do Enriquecimento", color = "Log2 FC", size = "Grau") +
+  theme(legend.position = "bottom", plot.title = element_text(size = 16, face = "bold"))
+
+```
+
+### 3.0 Modularization with WGCNA
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 12
+#| fig-height: 8
+expr_wgcna <- t(assay(vsd))
+trait_mat <- meta %>%
+  mutate(
+    AD_vs_Ctrl = ifelse(group == "AD", 1, 0),
+    Braak_Score = as.numeric(braak),
+    Age_numeric = suppressWarnings(as.numeric(gsub("\\+", "", age)))
+  ) %>%
+  dplyr::select(AD_vs_Ctrl, Braak_Score, Age_numeric) %>% as.matrix()
+rownames(trait_mat) <- meta$sample
+
+net <- blockwiseModules(expr_wgcna, power = 6, TOMType = "unsigned", minModuleSize = 50, mergeCutHeight = 0.25, numericLabels = TRUE, verbose = 0)
+module_eigengenes <- net$MEs
+
+mod_trait_cor <- cor(module_eigengenes, trait_mat, use = "p")
+mod_trait_p <- corPvalueStudent(mod_trait_cor, nrow(expr_wgcna))
+
+pheatmap(mod_trait_cor, 
+         display_numbers = matrix(ifelse(mod_trait_p < 0.05, "*", ""), nrow(mod_trait_p)),
+         color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(50),
+         main = "WGCNA: Correlação Módulo vs Fenótipos", fontsize_number = 15)
+
+```
+
+### 3.1 PPI + WGCNA MODULES
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 14
+#| fig-height: 8
+
+plot_module_ppi <- function(module_name) {
+  genes_wgcna <- data.frame(
+    gene = colnames(expr_wgcna),
+    Module = paste0("ME", net$colors)
+  ) %>%
+    left_join(res_df_anotado %>% dplyr::select(gene, Gene_Symbol, log2FoldChange), by = "gene") %>%
+    filter(Module == module_name, !is.na(Gene_Symbol)) %>%
+    distinct(Gene_Symbol, .keep_all = TRUE)
+
+  mapped_mod <- string_db$map(genes_wgcna, "Gene_Symbol", removeUnmappedRows = TRUE) %>% 
+    filter(!is.na(STRING_id)) %>% distinct(STRING_id, .keep_all = TRUE)
+
+  hits_mod <- mapped_mod$STRING_id
+  interacoes_mod <- string_db$get_interactions(hits_mod)
+  
+  if(nrow(interacoes_mod) == 0) return(NULL) 
+  edges_mod <- interacoes_mod[, c("from", "to")]
+  edges_mod <- edges_mod[complete.cases(edges_mod), ]
+
+  grafo_mod <- igraph::graph_from_data_frame(edges_mod, directed = FALSE)
+
+  tidy_mod_ppi <- as_tbl_graph(grafo_mod) %>%
+    activate(nodes) %>%
+    mutate(STRING_id = name) %>%
+    left_join(mapped_mod, by = "STRING_id") %>%
+    mutate(degree = centrality_degree(),
+           componente = group_components()) %>%
+    filter(componente == 1) %>% 
+    mutate(
+      is_hub = degree >= quantile(degree, 0.85, na.rm = TRUE),
+      node_alpha = ifelse(is_hub, 1, 0.2) 
+    )
+
+  p <- ggraph(tidy_mod_ppi, layout = "fr") + 
+    geom_edge_link(alpha = 0.2, color = "grey50") +
+    geom_node_point(aes(size = degree, color = log2FoldChange, alpha = node_alpha)) +
+    scale_color_gradient2(low = "royalblue", mid = "white", high = "firebrick", midpoint = 0, name = "Log2FC (AD vs Ctrl)") +
+    scale_size_continuous(range = c(2, 9), guide = "none") +
+    scale_alpha_identity() + 
+    theme_void() + 
+    labs(title = paste("Módulo:", module_name)) +
+    theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5), legend.position = "bottom")
+  
+  return(p)
+}
+
+set.seed(123)
+ppi_me5 <- plot_module_ppi("ME5")
+ppi_me3 <- plot_module_ppi("ME3")
+ppi_me17 <- plot_module_ppi("ME17")
+(ppi_me5 | ppi_me3 | ppi_me17) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom") &
+  plot_annotation(
+    title = "Redes PPI Individuais por Módulo WGCNA",
+    theme = theme(plot.title = element_text(size = 16, face = "bold"))
+  )
+
+
+```
+
+### 4.0 Lioness setup and visualization
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 10
+#| fig-height: 10
+
+gene_vars <- rowVars(assay(vsd))
+top_var_idx <- order(gene_vars, decreasing = TRUE)[1:1000]
+expr_top_var <- assay(vsd)[top_var_idx, ]
+
+se_filtered <- SummarizedExperiment(assays = list(counts = expr_top_var),
+  colData = DataFrame(sample = colnames(expr_top_var), row.names = colnames(expr_top_var)),
+  rowData = DataFrame(gene = rownames(expr_top_var), row.names = rownames(expr_top_var)))
+
+lioness_cor_optimized <- function(se) {
+  X <- assay(se); n <- ncol(X); S <- rowSums(X); SS <- rowSums(X^2); SP <- X %*% t(X)
+  num_full <- SP - outer(S, S) / n; den_full <- sqrt((SS - S^2 / n) %o% (SS - S^2 / n)); C_full <- num_full / den_full
+  ut_idx <- which(upper.tri(C_full), arr.ind = TRUE)
+  genes <- rownames(X); reg_names <- genes[ut_idx[, 1]]; tar_names <- genes[ut_idx[, 2]]; v_full <- C_full[ut_idx]
+  out <- matrix(NA_real_, nrow = length(reg_names), ncol = n); colnames(out) <- colnames(X)
+  for (q in seq_len(n)) {
+    xq <- X[, q]; S_q <- S - xq; SS_q <- SS - xq^2; SP_q <- SP - xq %*% t(xq)
+    num_q <- SP_q - outer(S_q, S_q) / (n - 1); den_q <- sqrt((SS_q - S_q^2 / (n - 1)) %o% (SS_q - S_q^2 / (n - 1)))
+    C_q <- num_q / den_q; out[, q] <- n * (v_full - C_q[ut_idx]) + C_q[ut_idx]
+  }
+  list(W = out, reg = reg_names, tar = tar_names)
+}
+
+lioness_out <- lioness_cor_optimized(se_filtered)
+W <- lioness_out$W
+reg_names <- lioness_out$reg
+tar_names <- lioness_out$tar
+
+idx_ad <- which(meta$group == "AD")
+idx_ctrl <- which(meta$group == "Control")
+
+W_ad <- rowMeans(W[, idx_ad], na.rm = TRUE)
+W_ctrl <- rowMeans(W[, idx_ctrl], na.rm = TRUE)
+
+edge_diff <- data.frame(from = reg_names, to = tar_names, diff_weight = W_ad - W_ctrl) %>%
+  filter(from != to) %>% arrange(desc(abs(diff_weight))) %>% head(60) %>% 
+  mutate(Edge_Type = ifelse(diff_weight > 0, "Ganha no AD", "Perdida no AD"))
+
+diff_graph <- as_tbl_graph(igraph::graph_from_data_frame(edge_diff, directed = FALSE)) %>%
+  activate(nodes) %>% left_join(res_df_anotado %>% dplyr::select(gene, Gene_Symbol, status), by = c("name" = "gene")) %>%
+  mutate(Gene_Symbol = ifelse(is.na(Gene_Symbol), name, Gene_Symbol), status = replace_na(status, "NS"))
+
+set.seed(42)
+ggraph(diff_graph, layout = "fr") +
+  geom_edge_link(aes(color = Edge_Type, edge_width = abs(diff_weight)), alpha = 0.8) +
+  geom_node_point(aes(fill = status), shape = 21, size = 11, color = "black", stroke = 0.8) +
+  geom_node_text(aes(label = Gene_Symbol), size = 3.5, fontface = "italic", color = "black") +
+  scale_edge_color_manual(values = c("Ganha no AD" = "#e31a1c", "Perdida no AD" = "#2171b5")) +
+  scale_fill_manual(values = c("Up em AD" = "#fc9272", "Down em AD" = "#9ecae1", "NS" = "white")) +
+  scale_edge_width_continuous(range = c(1, 3), guide = "none") + theme_void() +
+  labs(title = "Rede Diferencial de Conectividade LIONESS", fill = "Expressão Diferencial", edge_color = "Interação") +
+  theme(legend.position = "bottom", plot.title = element_text(size = 16, face = "bold"))
+```
